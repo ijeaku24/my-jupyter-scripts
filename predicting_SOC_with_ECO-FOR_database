@@ -1,0 +1,76 @@
+import geopandas as gpd
+import joblib
+from pathlib import Path
+import shapely.wkt
+import pandas as pd
+
+# === File paths ===
+gpkg_path = Path("/Users/adimi/PyCharm_SOC/SOC_classifier/new_data/merged_extracted_data_final_with_coords_with_attrs.gpkg")
+models_dir = Path("/Users/adimi/PyCharm_SOC/SOC_classifier/plots2")
+output_dir = models_dir  # save outputs in the same folder as the RF models
+
+# === Column mapping ===
+column_mapping = {
+    "epais_mine": "thickness_cm",
+    "veg_pot": "VEG_POT",
+    "type_couv": "type_couvc",
+    "dep_sur_simp": "dep_sur"
+}
+
+# === RF models paths ===
+model_files = {
+    "SOC_mineral_with_thickness": models_dir / "RF_SOC_mineral_with_thickness.pkl",
+    "SOC_mineral_without_thickness": models_dir / "RF_SOC_mineral_without_thickness.pkl",
+    "SOC_organic_with_thickness": models_dir / "RF_SOC_organic_with_thickness.pkl",
+    "SOC_organic_without_thickness": models_dir / "RF_SOC_organic_without_thickness.pkl",
+    "TotalSOC_with_thickness": models_dir / "RF_TotalSOC_with_thickness.pkl",
+    "TotalSOC_without_thickness": models_dir / "RF_TotalSOC_without_thickness.pkl",
+}
+
+# === Load models ===
+models = {name: joblib.load(path) for name, path in model_files.items()}
+
+# === Prediction function ===
+def predict_gdf(gdf_chunk, model):
+    # Rename columns to match model features
+    gdf_chunk = gdf_chunk.rename(columns=column_mapping)
+    
+    feature_names = model.feature_names_in_
+    missing_features = [f for f in feature_names if f not in gdf_chunk.columns]
+    if missing_features:
+        raise ValueError(f"Missing features: {missing_features}")
+    
+    X = gdf_chunk[feature_names]
+    gdf_chunk["prediction"] = model.predict(X)
+    
+    return gdf_chunk
+
+# === Read original GPKG and convert geometry to WKT for chunking ===
+gdf = gpd.read_file(gpkg_path)
+gdf["geometry_wkt"] = gdf.geometry.apply(lambda x: x.wkt)
+gdf.drop(columns="geometry", inplace=True)
+
+chunk_size = 500_000  # adjust depending on RAM
+
+# === Process each model separately ===
+for model_name, model in models.items():
+    first_chunk = True
+    output_file = output_dir / f"{model_name}_predictions.gpkg"
+    
+    for i, df_chunk in enumerate(pd.read_csv(gdf.to_csv(index=False), chunksize=chunk_size)):
+        gdf_chunk = gpd.GeoDataFrame(df_chunk, geometry=df_chunk["geometry_wkt"].apply(lambda x: shapely.wkt.loads(x)), crs=gdf.crs)
+        gdf_chunk = predict_gdf(gdf_chunk, model)
+        
+        # Drop WKT column before saving
+        gdf_chunk.drop(columns="geometry_wkt", inplace=True)
+        
+        # Save to GPKG
+        if first_chunk:
+            gdf_chunk.to_file(output_file, driver="GPKG")
+            first_chunk = False
+        else:
+            gdf_chunk.to_file(output_file, driver="GPKG", mode="a")
+        
+        print(f"{model_name}: processed chunk {i+1}")
+    
+    print(f"{model_name} predictions saved to {output_file}")
